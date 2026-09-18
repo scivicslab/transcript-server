@@ -1,0 +1,34 @@
+# Transcript REST server for the aarch64 GB10 hosts (192.168.5.18/19).
+# Same REST API as the x86_64 image (Dockerfile), but Whisper runs through
+# openai-whisper on PyTorch: the CTranslate2 wheels behind faster-whisper have
+# no CUDA support on aarch64. PyTorch comes from the CUDA 13 aarch64 wheel index
+# (the GB10 driver is 580.x / CUDA 13.0).
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+        torch --index-url https://download.pytorch.org/whl/cu130 \
+    && pip install --no-cache-dir \
+        openai-whisper \
+        yt-dlp \
+        fastapi \
+        "uvicorn[standard]" \
+        pydantic
+
+WORKDIR /app
+COPY server.py /app/server.py
+
+ENV WHISPER_BACKEND=openai-whisper
+ENV WHISPER_MODEL=large-v3
+ENV WHISPER_DEVICE=cuda
+ENV WHISPER_COMPUTE_TYPE=float16
+ENV WHISPER_KEEP_LOADED=1
+# Whisper weights are downloaded on first load into this cache; mount a volume
+# on it so a container restart does not re-download the 3 GB.
+ENV XDG_CACHE_HOME=/cache
+EXPOSE 8000
+
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]

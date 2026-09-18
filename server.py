@@ -2,7 +2,8 @@
 """
 Transcript REST server for quarkus-exdb2 (Video tab).
 
-Downloads a video's audio with yt-dlp and transcribes it with faster-whisper,
+Downloads a video's audio with yt-dlp and transcribes it with Whisper (faster-whisper
+on x86_64, openai-whisper/PyTorch on the aarch64 GB10 hosts; see WHISPER_BACKEND),
 returning Whisper segments so that quarkus-exdb2 (Java) can chunk and store them
 via TranscriptClient. See VideoTranscriptLifecycle_260601_oo01.
 
@@ -38,6 +39,12 @@ logger = logging.getLogger("transcript-server")
 MODEL_SIZE = os.environ.get("WHISPER_MODEL", "large-v3")
 DEVICE = os.environ.get("WHISPER_DEVICE", "cuda")
 COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "float16")
+# Which Whisper implementation to run. "faster-whisper" (CTranslate2) is the
+# original and the fastest on x86_64 GPUs, but the CTranslate2 wheels for
+# aarch64 have no CUDA support (verified on the GB10: 0 CUDA devices), so on the
+# GB10 hosts the "openai-whisper" backend (PyTorch, CUDA-13 aarch64 wheels)
+# is used instead. Both return the same segments through _Backend.
+BACKEND = os.environ.get("WHISPER_BACKEND", "faster-whisper")
 # Keep the model resident between requests. Default true: Marker and Whisper run
 # concurrently on the 5.13 RTX 4080 (16GB) — Marker ~3.7GB + Whisper ~3-5GB fits —
 # so there is no need to unload, and keeping it loaded avoids per-request load wait.
@@ -53,19 +60,103 @@ class TranscriptRequest(BaseModel):
     url: str
 
 
+class _Segment:
+    """One transcribed segment; the shape both backends are normalised to."""
+    __slots__ = ("start", "end", "text")
+
+    def __init__(self, start, end, text):
+        self.start, self.end, self.text = start, end, text
+
+
+class _FasterWhisperBackend:
+    """faster-whisper (CTranslate2)."""
+
+    def __init__(self):
+        global DEVICE, COMPUTE_TYPE
+        from faster_whisper import WhisperModel
+        try:
+            self.model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
+            logger.info("faster-whisper %s loaded on %s/%s", MODEL_SIZE, DEVICE, COMPUTE_TYPE)
+        except Exception as e:
+            logger.warning("Failed on %s (%s); falling back to cpu/int8", DEVICE, e)
+            DEVICE, COMPUTE_TYPE = "cpu", "int8"
+            self.model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
+
+    def transcribe(self, audio_path, language):
+        segments, _info = self.model.transcribe(audio_path, language=language)
+        return [_Segment(s.start, s.end, s.text) for s in segments]
+
+
+_OPENAI_WHISPER_WORKER = r"""
+import json, sys
+import torch, whisper
+audio, model_size, device, language, fp16 = sys.argv[1:6]
+if device == "cuda" and not torch.cuda.is_available():
+    device = "cpu"
+model = whisper.load_model(model_size, device=device)
+result = model.transcribe(audio, language=language, fp16=(fp16 == "1" and device == "cuda"))
+json.dump({"device": device,
+           "segments": [{"start": s["start"], "end": s["end"], "text": s["text"]}
+                        for s in result.get("segments", [])]}, sys.stdout)
+"""
+
+
+class _OpenAiWhisperBackend:
+    """openai-whisper (PyTorch). Used on aarch64 GPU hosts (GB10).
+
+    With WHISPER_KEEP_LOADED=1 the model stays resident in this process. With
+    WHISPER_KEEP_LOADED=0 every request runs in a short-lived worker process:
+    on the GB10 the unified memory a CUDA process has touched is not returned
+    to the host by unloading the model (the uvicorn process kept 4.2 GB RSS
+    and MemAvailable stayed 8 GB after unloading), and the host is shared with
+    a vLLM server that must not be starved, so the memory is released by
+    letting the worker process exit. Loading large-v3 from the local cache
+    costs about 10 s per request.
+    """
+
+    def __init__(self):
+        global DEVICE
+        self.fp16 = (DEVICE == "cuda" and COMPUTE_TYPE == "float16")
+        self.model = None
+        if KEEP_LOADED:
+            import torch
+            import whisper
+            if DEVICE == "cuda" and not torch.cuda.is_available():
+                logger.warning("CUDA not available to PyTorch; falling back to cpu")
+                DEVICE = "cpu"
+            self.model = whisper.load_model(MODEL_SIZE, device=DEVICE)
+            logger.info("openai-whisper %s loaded on %s (fp16=%s)", MODEL_SIZE, DEVICE, self.fp16)
+        else:
+            logger.info("openai-whisper %s: one worker process per request on %s", MODEL_SIZE, DEVICE)
+
+    def transcribe(self, audio_path, language):
+        if self.model is not None:
+            result = self.model.transcribe(audio_path, language=language, fp16=self.fp16)
+            return [_Segment(s["start"], s["end"], s["text"]) for s in result.get("segments", [])]
+        import json
+        import subprocess
+        import sys
+        proc = subprocess.run(
+            [sys.executable, "-c", _OPENAI_WHISPER_WORKER, audio_path, MODEL_SIZE, DEVICE,
+             language, "1" if self.fp16 else "0"],
+            capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError("whisper worker failed: " + proc.stderr[-2000:])
+        result = json.loads(proc.stdout)
+        return [_Segment(s["start"], s["end"], s["text"]) for s in result["segments"]]
+
+
 def _load_model():
-    """Load the faster-whisper model (CUDA, CPU fallback)."""
-    global _model, DEVICE, COMPUTE_TYPE
+    """Load the Whisper backend selected by WHISPER_BACKEND (CUDA, CPU fallback)."""
+    global _model
     if _model is not None:
         return _model
-    from faster_whisper import WhisperModel
-    try:
-        _model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-        logger.info("Whisper %s loaded on %s/%s", MODEL_SIZE, DEVICE, COMPUTE_TYPE)
-    except Exception as e:
-        logger.warning("Failed on %s (%s); falling back to cpu/int8", DEVICE, e)
-        DEVICE, COMPUTE_TYPE = "cpu", "int8"
-        _model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
+    if BACKEND == "openai-whisper":
+        _model = _OpenAiWhisperBackend()
+    elif BACKEND == "faster-whisper":
+        _model = _FasterWhisperBackend()
+    else:
+        raise ValueError("unknown WHISPER_BACKEND: " + BACKEND)
     return _model
 
 
@@ -157,7 +248,8 @@ def _fetch_thumbnail_data_uri(thumb_url: str) -> str:
 
 @app.get("/health")
 def health():
-    return {"loaded": "whisper" if _model is not None else "none", "device": DEVICE}
+    return {"loaded": "whisper" if _model is not None else "none", "device": DEVICE,
+            "backend": BACKEND}
 
 
 @app.post("/transcript")
@@ -173,11 +265,11 @@ def transcript(req: TranscriptRequest):
             title, audio_path, thumb_url = _download_audio(url, workdir)
             thumbnail = _fetch_thumbnail_data_uri(thumb_url)
             model = _load_model()
-            segments_iter, info = model.transcribe(audio_path, language="en")
             segments = [
                 {"start": round(s.start, 2), "end": round(s.end, 2),
                  "text": s.text.strip()}
-                for s in segments_iter if s.text and s.text.strip()
+                for s in model.transcribe(audio_path, language="en")
+                if s.text and s.text.strip()
             ]
             return {"success": True, "title": title or url,
                     "thumbnail": thumbnail, "segments": segments}
