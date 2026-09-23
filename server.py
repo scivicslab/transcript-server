@@ -13,6 +13,16 @@ Endpoints:
     -> {"success": true, "title": "...", "segments": [{"start": 0.0, "end": 4.2, "text": "..."}]}
        on failure: {"success": false, "error": "..."}
 
+       Also "thumbnail" (data: URI) and, when the download carried a video stream,
+       "frames": {"url": "<PUBLIC_BASE_URL>/frames", "token": "...", "hasVideo": true}:
+       the media file is kept for FRAME_KEEP_SECONDS so that /frames can cut stills
+       from it without a second download.
+
+  POST /frames       (application/json)
+    {"token": "...", "times": [12.3, 45.0], "width": 640}      -- from a kept media file
+    {"url": "https://...", "times": [...], "width": 640}        -- downloads 360p video again
+    -> {"success": true, "frames": [{"time": 12.3, "image": "data:image/jpeg;base64,..."}]}
+
   GET /health        -> {"loaded": "whisper"|"none", "device": "cuda"|"cpu"}
 
 GPU co-residency with Marker (same host 192.168.5.13, Marker on :8001, this on
@@ -49,6 +59,14 @@ BACKEND = os.environ.get("WHISPER_BACKEND", "faster-whisper")
 # concurrently on the 5.13 RTX 4080 (16GB) — Marker ~3.7GB + Whisper ~3-5GB fits —
 # so there is no need to unload, and keeping it loaded avoids per-request load wait.
 KEEP_LOADED = os.environ.get("WHISPER_KEEP_LOADED", "1") == "1"
+# How long a transcribed video's media file is kept for /frames, and the address a
+# client uses to reach THIS server for it. Requests arrive through quarkus-gpu-broker,
+# which spreads them over several servers, so the transcript answer must name the
+# server that holds the file.
+FRAME_KEEP_SECONDS = int(os.environ.get("FRAME_KEEP_SECONDS", "1800"))
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+# Video stream height for stills; 360p keeps a one-hour lecture near 150 MB.
+FRAME_VIDEO_HEIGHT = int(os.environ.get("FRAME_VIDEO_HEIGHT", "360"))
 
 app = FastAPI(title="Transcript server (yt-dlp + faster-whisper)")
 
@@ -58,6 +76,18 @@ _lock = threading.Lock()   # serialize transcription so only one run holds VRAM
 
 class TranscriptRequest(BaseModel):
     url: str
+
+
+class FramesRequest(BaseModel):
+    token: str | None = None
+    url: str | None = None
+    times: list[float]
+    width: int = 640
+
+
+# Media files kept after transcription: token -> (path, expires_at). Guarded by _kept_lock.
+_kept = {}
+_kept_lock = threading.Lock()
 
 
 class _Segment:
@@ -190,18 +220,29 @@ _PLAYER_CLIENT_SETS = [
 ]
 
 
-def _download_audio(url: str, workdir: str) -> str:
-    """Download bestaudio to a local file with yt-dlp; return (title, path, thumbnail).
+# Whisper reads the audio track of an mp4 as readily as an m4a, so one download serves both
+# the transcript and the stills: small video plus best audio, merged by ffmpeg; a progressive
+# file of that size; and audio only when the site offers no video (then /frames has nothing).
+_FORMAT_MEDIA = ("bv*[height<=%d][ext=mp4]+ba[ext=m4a]/bv*[height<=%d]+ba/b[height<=%d]/bestaudio/best"
+                 % (FRAME_VIDEO_HEIGHT, FRAME_VIDEO_HEIGHT, FRAME_VIDEO_HEIGHT))
+# For /frames by url (a video imported before stills existed): the video stream alone.
+_FORMAT_VIDEO_ONLY = "bv*[height<=%d][ext=mp4]/bv*[height<=%d]/b[height<=%d]" % (
+    FRAME_VIDEO_HEIGHT, FRAME_VIDEO_HEIGHT, FRAME_VIDEO_HEIGHT)
+
+
+def _download_audio(url: str, workdir: str, fmt: str = _FORMAT_MEDIA) -> str:
+    """Download the media to a local file with yt-dlp; return (title, path, thumbnail).
 
     Tries multiple YouTube player clients (with retries) so an intermittent HTTP 403
     on one client's media URL falls through to another instead of failing the request.
     """
     import yt_dlp
-    out_tmpl = os.path.join(workdir, "audio.%(ext)s")
+    out_tmpl = os.path.join(workdir, "media.%(ext)s")
     last_error = None
     for clients in _PLAYER_CLIENT_SETS:
         ydl_opts = {
-            "format": "bestaudio/best",
+            "format": fmt,
+            "merge_output_format": "mp4",
             "outtmpl": out_tmpl,
             "quiet": True,
             "no_warnings": True,
@@ -218,8 +259,13 @@ def _download_audio(url: str, workdir: str) -> str:
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                return (info.get("title"), ydl.prepare_filename(info),
-                        info.get("thumbnail"))
+                path = ydl.prepare_filename(info)
+                if not os.path.exists(path):
+                    # A merged download is written as <name>.mp4 whatever the parts were called.
+                    merged = os.path.splitext(path)[0] + ".mp4"
+                    if os.path.exists(merged):
+                        path = merged
+                return (info.get("title"), path, info.get("thumbnail"))
         except Exception as e:
             last_error = e
             logger.warning("yt-dlp download failed with player_client=%s: %s", clients, e)
@@ -244,6 +290,106 @@ def _fetch_thumbnail_data_uri(thumb_url: str) -> str:
     except Exception as e:
         logger.warning("thumbnail fetch failed: %s", e)
         return ""
+
+
+def _has_video(path: str) -> bool:
+    """Whether the file carries a video stream (ffprobe)."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=codec_type", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30).stdout
+        return "video" in out
+    except Exception as e:
+        logger.warning("ffprobe failed: %s", e)
+        return False
+
+
+def _keep_media(workdir: str, path: str) -> str:
+    """Register the media file for /frames and return its token."""
+    import secrets
+    import time
+    token = secrets.token_urlsafe(16)
+    with _kept_lock:
+        _kept[token] = (workdir, path, time.time() + FRAME_KEEP_SECONDS)
+    return token
+
+
+def _sweep_kept():
+    """Delete kept media whose time is up; runs every minute in a daemon thread."""
+    import shutil
+    import time
+    while True:
+        time.sleep(60)
+        now = time.time()
+        with _kept_lock:
+            expired = [t for t, (_, _, exp) in _kept.items() if exp <= now]
+            entries = [(_kept.pop(t)) for t in expired]
+        for workdir, _, _ in entries:
+            shutil.rmtree(workdir, ignore_errors=True)
+        if entries:
+            logger.info("removed %d expired media file(s)", len(entries))
+
+
+threading.Thread(target=_sweep_kept, daemon=True, name="kept-media-sweeper").start()
+
+
+def _cut_frame(path: str, t: float, width: int) -> str:
+    """One still at second t as a data: URI (JPEG, scaled to width). Empty on failure."""
+    import base64
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "error", "-ss", "%.3f" % max(0.0, t), "-i", path,
+             "-frames:v", "1", "-vf", "scale=%d:-2" % width, "-q:v", "4",
+             "-f", "image2pipe", "-vcodec", "mjpeg", "-"],
+            capture_output=True, timeout=60)
+        if proc.returncode != 0 or not proc.stdout:
+            logger.warning("ffmpeg still at %.1fs failed: %s", t, proc.stderr[-300:])
+            return ""
+        return "data:image/jpeg;base64," + base64.b64encode(proc.stdout).decode("ascii")
+    except Exception as e:
+        logger.warning("ffmpeg still at %.1fs failed: %s", t, e)
+        return ""
+
+
+@app.post("/frames")
+def frames(req: FramesRequest):
+    """Stills at the requested seconds, from a kept media file (token) or a fresh 360p download (url)."""
+    import shutil
+    times = [float(t) for t in (req.times or [])]
+    width = max(64, min(int(req.width or 640), 1920))
+    if not times:
+        return JSONResponse(status_code=400, content={"success": False, "error": "missing times"})
+    path = None
+    tmp_workdir = None
+    if req.token:
+        with _kept_lock:
+            entry = _kept.get(req.token)
+        if entry is None:
+            return JSONResponse(status_code=404,
+                                content={"success": False, "error": "unknown or expired token"})
+        path = entry[1]
+    elif req.url:
+        tmp_workdir = tempfile.mkdtemp(prefix="frames_")
+        try:
+            _, path, _ = _download_audio(req.url.strip(), tmp_workdir, fmt=_FORMAT_VIDEO_ONLY)
+        except Exception as e:
+            shutil.rmtree(tmp_workdir, ignore_errors=True)
+            logger.exception("frames download failed")
+            return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+    else:
+        return JSONResponse(status_code=400, content={"success": False, "error": "token or url required"})
+    try:
+        if not _has_video(path):
+            return JSONResponse(status_code=422,
+                                content={"success": False, "error": "media has no video stream"})
+        out = [{"time": t, "image": _cut_frame(path, t, width)} for t in times]
+        return {"success": True, "frames": out}
+    finally:
+        if tmp_workdir:
+            shutil.rmtree(tmp_workdir, ignore_errors=True)
 
 
 @app.get("/health")
@@ -271,18 +417,28 @@ def transcript(req: TranscriptRequest):
                 for s in model.transcribe(audio_path, language="en")
                 if s.text and s.text.strip()
             ]
-            return {"success": True, "title": title or url,
-                    "thumbnail": thumbnail, "segments": segments}
+            answer = {"success": True, "title": title or url,
+                      "thumbnail": thumbnail, "segments": segments}
+            # Keep the media for /frames when it has pictures to cut and a client can find us.
+            if PUBLIC_BASE_URL and _has_video(audio_path):
+                token = _keep_media(workdir, audio_path)
+                workdir = None          # now owned by the sweeper
+                answer["frames"] = {"url": PUBLIC_BASE_URL + "/frames", "token": token,
+                                    "hasVideo": True}
+            else:
+                answer["frames"] = {"hasVideo": False}
+            return answer
         except Exception as e:
             logger.exception("transcription failed")
             return JSONResponse(status_code=500,
                                 content={"success": False, "error": str(e)})
         finally:
-            # Always clean the temp audio; unload the model unless asked to keep it.
-            try:
-                import shutil
-                shutil.rmtree(workdir, ignore_errors=True)
-            except Exception:
-                pass
+            # Clean the temp media unless it was kept for /frames; unload the model unless asked to keep it.
+            if workdir is not None:
+                try:
+                    import shutil
+                    shutil.rmtree(workdir, ignore_errors=True)
+                except Exception:
+                    pass
             if not KEEP_LOADED:
                 _unload_model()
