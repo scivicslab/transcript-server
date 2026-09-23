@@ -9,7 +9,8 @@ via TranscriptClient. See VideoTranscriptLifecycle_260601_oo01.
 
 Endpoints:
   POST /transcript   (application/json)
-    {"url": "https://www.youtube.com/watch?v=..."}
+    {"url": "https://www.youtube.com/watch?v=..."}     -- or, for a file on the users' shared
+    {"file": "<user>/videos/lecture.mp4"}              --    storage mounted at MEDIA_ROOT
     -> {"success": true, "title": "...", "segments": [{"start": 0.0, "end": 4.2, "text": "..."}]}
        on failure: {"success": false, "error": "..."}
 
@@ -75,14 +76,38 @@ _lock = threading.Lock()   # serialize transcription so only one run holds VRAM
 
 
 class TranscriptRequest(BaseModel):
-    url: str
+    url: str | None = None
+    # A media file already on this server's MEDIA_ROOT (the users' shared storage, mounted
+    # read-only), as a path relative to that root. Used for files uploaded with File Browser.
+    file: str | None = None
 
 
 class FramesRequest(BaseModel):
     token: str | None = None
     url: str | None = None
+    file: str | None = None
     times: list[float]
     width: int = 640
+
+
+# Where uploaded media can be read from (a read-only mount of the users' storage). Empty = off.
+MEDIA_ROOT = os.environ.get("MEDIA_ROOT", "").rstrip("/")
+
+
+def _resolve_media_file(rel: str) -> str:
+    """The absolute path of a client-named file under MEDIA_ROOT, or a ValueError."""
+    if not MEDIA_ROOT:
+        raise ValueError("local media is not enabled on this server (MEDIA_ROOT unset)")
+    rel = (rel or "").strip().lstrip("/")
+    if not rel:
+        raise ValueError("missing file")
+    path = os.path.realpath(os.path.join(MEDIA_ROOT, rel))
+    root = os.path.realpath(MEDIA_ROOT)
+    if path != root and not path.startswith(root + os.sep):
+        raise ValueError("file is outside the media root")
+    if not os.path.isfile(path):
+        raise ValueError("no such file: " + rel)
+    return path
 
 
 # Media files kept after transcription: token -> (path, expires_at). Guarded by _kept_lock.
@@ -327,7 +352,8 @@ def _sweep_kept():
             expired = [t for t, (_, _, exp) in _kept.items() if exp <= now]
             entries = [(_kept.pop(t)) for t in expired]
         for workdir, _, _ in entries:
-            shutil.rmtree(workdir, ignore_errors=True)
+            if workdir:                      # a downloaded file; a shared-storage file is not ours to delete
+                shutil.rmtree(workdir, ignore_errors=True)
         if entries:
             logger.info("removed %d expired media file(s)", len(entries))
 
@@ -364,7 +390,12 @@ def frames(req: FramesRequest):
         return JSONResponse(status_code=400, content={"success": False, "error": "missing times"})
     path = None
     tmp_workdir = None
-    if req.token:
+    if req.file:
+        try:
+            path = _resolve_media_file(req.file)
+        except ValueError as e:
+            return JSONResponse(status_code=400, content={"success": False, "error": str(e)})
+    elif req.token:
         with _kept_lock:
             entry = _kept.get(req.token)
         if entry is None:
@@ -380,7 +411,7 @@ def frames(req: FramesRequest):
             logger.exception("frames download failed")
             return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
     else:
-        return JSONResponse(status_code=400, content={"success": False, "error": "token or url required"})
+        return JSONResponse(status_code=400, content={"success": False, "error": "token, url or file required"})
     try:
         if not _has_video(path):
             return JSONResponse(status_code=422,
@@ -401,15 +432,23 @@ def health():
 @app.post("/transcript")
 def transcript(req: TranscriptRequest):
     url = (req.url or "").strip()
-    if not url:
+    if not url and not req.file:
         return JSONResponse(status_code=400,
-                            content={"success": False, "error": "missing url"})
+                            content={"success": False, "error": "missing url or file"})
     # Serialize: only one transcription holds VRAM at a time (co-resident Marker).
     with _lock:
         workdir = tempfile.mkdtemp(prefix="transcript_")
         try:
-            title, audio_path, thumb_url = _download_audio(url, workdir)
-            thumbnail = _fetch_thumbnail_data_uri(thumb_url)
+            if req.file:
+                # A file on the shared storage: nothing to download; the title is its name and the
+                # poster is its first second. It stays where it is (workdir holds nothing).
+                audio_path = _resolve_media_file(req.file)
+                title = os.path.splitext(os.path.basename(audio_path))[0]
+                url = "file:" + req.file.strip().lstrip("/")
+                thumbnail = _cut_frame(audio_path, 1.0, 320) if _has_video(audio_path) else ""
+            else:
+                title, audio_path, thumb_url = _download_audio(url, workdir)
+                thumbnail = _fetch_thumbnail_data_uri(thumb_url)
             model = _load_model()
             segments = [
                 {"start": round(s.start, 2), "end": round(s.end, 2),
@@ -421,13 +460,18 @@ def transcript(req: TranscriptRequest):
                       "thumbnail": thumbnail, "segments": segments}
             # Keep the media for /frames when it has pictures to cut and a client can find us.
             if PUBLIC_BASE_URL and _has_video(audio_path):
-                token = _keep_media(workdir, audio_path)
-                workdir = None          # now owned by the sweeper
+                if req.file:
+                    token = _keep_media(None, audio_path)     # shared-storage file: never deleted
+                else:
+                    token = _keep_media(workdir, audio_path)
+                    workdir = None      # now owned by the sweeper
                 answer["frames"] = {"url": PUBLIC_BASE_URL + "/frames", "token": token,
                                     "hasVideo": True}
             else:
                 answer["frames"] = {"hasVideo": False}
             return answer
+        except ValueError as e:
+            return JSONResponse(status_code=400, content={"success": False, "error": str(e)})
         except Exception as e:
             logger.exception("transcription failed")
             return JSONResponse(status_code=500,
